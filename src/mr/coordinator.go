@@ -7,6 +7,7 @@ import (
 	"net/rpc"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"time"
 )
@@ -131,9 +132,14 @@ func (c *Coordinator) Done() bool {
 
 	if allMapDone && allReduceDone && !c.done {
 		c.done = true
-		files, _ := filepath.Glob("mr-temp-*-*")
+		files, _ := filepath.Glob("mr-*-*")
+		//正则表达式，匹配 mr-数字-数字
+		re := regexp.MustCompile(`^mr-(\d+)-(\d+)$`)
 		for _, f := range files {
-			os.Remove(f)
+			//mr-out-*也会被mr-*-*匹配到，所以要筛选一下，只删掉目标
+			if re.MatchString(f) {
+				os.Remove(f)
+			}
 		}
 	}
 	return c.done

@@ -128,7 +128,7 @@ func DoMap(mapTaskId int, filename string, nReduce int, mapf func(string, string
 
 	for i := 0; i < nReduce; i++ {
 		//Sprintf返回字符串,Fpringf返回File
-		oname := fmt.Sprintf("mr-temp-%d-%d", mapTaskId, i)
+		oname := fmt.Sprintf("mr-%d-%d", mapTaskId, i)
 		tempFiles[i] = oname
 		ofile, err := os.Create(oname)
 		if err != nil {
@@ -166,7 +166,7 @@ func DoReduce(reduceTaskId int, nMap int, reducef func(string, []string) string)
 	// 读所有的临时文件
 	for i := 0; i < nMap; i++ {
 		//读每个文件
-		filename := fmt.Sprintf("mr-temp-%d-%d", i, reduceTaskId)
+		filename := fmt.Sprintf("mr-%d-%d", i, reduceTaskId)
 		file, err := os.Open(filename)
 		if err != nil {
 			fmt.Println("Error:cannot open ", filename)
