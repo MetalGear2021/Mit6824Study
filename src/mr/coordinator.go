@@ -2,14 +2,14 @@ package mr
 
 import (
 	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
 )
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
 
 type TaskStatu int
 
@@ -23,24 +23,23 @@ type TaskInfo struct {
 	TaskId        int
 	TaskType      TaskType
 	TaskStatu     TaskStatu //0未领取，1已领取未完成，2已完成
-	TaskFileName  string    //Map任务专用流量
+	TaskFileName  string    //Map任务操作的文件
 	TaskReduceNum int       //总Reduce数量
-	AssignedTime  time.Time //用于超时检测
+	AssignedTime  time.Time //任务的注册时间，用于超时检测
 }
 
 type Coordinator struct {
-	// Your definitions here.
-	files         []string
+	files         []string //文件名的数组
 	nReduce       int
 	mapTasks      []TaskInfo //map任务状态
 	reduceTasks   []TaskInfo //reduce任务状态
 	mu            sync.Mutex //保护数组的mutex锁
 	done          bool       //任务是否完成
-	lastHeartbeat time.Time
+	lastHeartbeat time.Time  //记录上一次心态的时间
 }
 
-// Your code here -- RPC handlers for the worker to call.
-// 分配一个 Map 或 Reduce 任务
+// RPC方法，用来被call
+// TaskRequest分配一个 Map 或 Reduce 任务
 // 如果没有任务了，返回 Wait 或 Exit
 // 最后检查所有任务的状态
 func (c *Coordinator) TaskRequest(args *TaskRequestArgs, reply *TaskRequestReply) error {
@@ -87,7 +86,24 @@ func (c *Coordinator) TaskRequest(args *TaskRequestArgs, reply *TaskRequestReply
 	}
 
 	// 3.没有任务，但也都没完成，先等待
-	reply.TaskType = WaitTask
+	// 4.如果都完成了，那就通知Worker退出程序
+	if !c.done {
+		reply.TaskType = WaitTask
+	} else {
+		reply.TaskType = ExitTask
+	}
+	return nil
+}
+
+func (c *Coordinator) TaskReport(args *TaskReportArgs, reply *TaskReportReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// 标记某个任务完成,判定任务类型
+	if args.TaskType == MapTask {
+		c.mapTasks[args.TaskId].TaskStatu = TaskCompleted
+	} else if args.TaskType == ReduceTask {
+		c.reduceTasks[args.TaskId].TaskStatu = TaskCompleted
+	}
 	return nil
 }
 
@@ -121,58 +137,6 @@ func (c *Coordinator) Done() bool {
 		}
 	}
 	return c.done
-}
-
-func (c *Coordinator) TaskReport(args *TaskReportArgs, reply *TaskReportReply) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	// 标记某个任务完成,判定任务类型
-	if args.TaskType == MapTask {
-		c.mapTasks[args.TaskId].TaskStatu = TaskCompleted
-	} else if args.TaskType == ReduceTask {
-		c.reduceTasks[args.TaskId].TaskStatu = TaskCompleted
-	}
-	return nil
-}
-
-// server()用来发起一个线程，监听来自worker的RPC请求
-func (c *Coordinator) server() {
-	rpc.Register(c)
-	rpc.HandleHTTP()
-	//l, e := net.Listen("tcp", ":1234")
-	sockname := coordinatorSock()
-	os.Remove(sockname)
-	l, e := net.Listen("unix", sockname)
-	if e != nil {
-		log.Fatal("listen error:", e)
-	}
-	go http.Serve(l, nil)
-	//启动超时检测的go routine
-	go c.checkTimeout()
-}
-
-func (c *Coordinator) checkTimeout() {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		c.mu.Lock()
-		now := time.Now()
-
-		//检查Map任务是否超时
-		for i := range c.mapTasks {
-			if c.mapTasks[i].TaskStatu == TaskInProgress && now.Sub(c.mapTasks[i].AssignedTime) > 10*time.Second {
-				c.mapTasks[i].TaskStatu = TaskPending
-			}
-		}
-		//检查Reduce任务是否超时
-		for i := range c.reduceTasks {
-			if c.reduceTasks[i].TaskStatu == TaskInProgress && now.Sub(c.reduceTasks[i].AssignedTime) > 10*time.Second {
-				c.reduceTasks[i].TaskStatu = TaskPending
-			}
-		}
-		c.mu.Unlock()
-	}
 }
 
 // main/mrcoordinator.go 会调用这个方法
@@ -210,5 +174,45 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	c.done = false
 	c.server()
+	//启动超时检测的go routine
+	go c.checkTimeout()
 	return &c
+}
+
+// server()用来发起一个线程，监听来自worker的RPC请求
+func (c *Coordinator) server() {
+	rpc.Register(c)
+	rpc.HandleHTTP()
+	//l, e := net.Listen("tcp", ":1234")
+	sockname := coordinatorSock()
+	os.Remove(sockname)
+	l, e := net.Listen("unix", sockname)
+	if e != nil {
+		log.Fatal("listen error:", e)
+	}
+	go http.Serve(l, nil)
+}
+
+func (c *Coordinator) checkTimeout() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		c.mu.Lock()
+		now := time.Now()
+
+		//检查Map任务是否超时
+		for i := range c.mapTasks {
+			if c.mapTasks[i].TaskStatu == TaskInProgress && now.Sub(c.mapTasks[i].AssignedTime) > 10*time.Second {
+				c.mapTasks[i].TaskStatu = TaskPending
+			}
+		}
+		//检查Reduce任务是否超时
+		for i := range c.reduceTasks {
+			if c.reduceTasks[i].TaskStatu == TaskInProgress && now.Sub(c.reduceTasks[i].AssignedTime) > 10*time.Second {
+				c.reduceTasks[i].TaskStatu = TaskPending
+			}
+		}
+		c.mu.Unlock()
+	}
 }

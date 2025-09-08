@@ -17,6 +17,7 @@ import "strconv"
 func maybeCrash() {
 	max := big.NewInt(1000)
 	rr, _ := crand.Int(crand.Reader, max)
+	//1/2几率crash,直接终止程序
 	if false && rr.Int64() < 500 {
 		// crash!
 		os.Exit(1)

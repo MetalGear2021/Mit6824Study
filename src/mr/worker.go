@@ -3,16 +3,16 @@ package mr
 import (
 	"bufio"
 	"fmt"
+	"hash/fnv"
 	"io/ioutil"
+	"log"
+	"net/rpc"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
-import "log"
-import "net/rpc"
-import "hash/fnv"
 
 // for sorting by key.
 type ByKey []KeyValue
@@ -116,6 +116,14 @@ func DoMap(mapTaskId int, filename string, nReduce int, mapf func(string, string
 
 	//创建nReduce个临时文件(用指针),用数组存储
 	ofiles := make([]*os.File, nReduce)
+	// 在创建完所有 ofiles 后，确保所有文件最后正确关闭
+	defer func() {
+		for _, f := range ofiles {
+			if f != nil {
+				f.Close()
+			}
+		}
+	}()
 	tempFiles := make([]string, nReduce)
 
 	for i := 0; i < nReduce; i++ {
@@ -141,9 +149,7 @@ func DoMap(mapTaskId int, filename string, nReduce int, mapf func(string, string
 		_, err := fmt.Fprintf(ofiles[r], "%v %v\n", kv.Key, kv.Value)
 		if err != nil {
 			log.Printf("Error:write to %v failed:%v", ofiles[r].Name(), err)
-			for _, f := range ofiles {
-				f.Close()
-			}
+			//所有 nReduce 个文件都已创建成功，但现在写入出错，必须全部清理
 			for _, fname := range tempFiles {
 				os.Remove(fname)
 			}
@@ -151,10 +157,6 @@ func DoMap(mapTaskId int, filename string, nReduce int, mapf func(string, string
 		}
 	}
 
-	// 确保所有文件都被正确关闭
-	for i := 0; i < nReduce; i++ {
-		ofiles[i].Close()
-	}
 	return nil
 }
 
@@ -210,36 +212,8 @@ func DoReduce(reduceTaskId int, nMap int, reducef func(string, []string) string)
 	return nil
 }
 
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//func CallExample() {
-//
-//	// declare an argument structure.
-//	args := ExampleArgs{}
-//
-//	// fill in the argument(s).
-//	args.X = 99
-//
-//	// declare a reply structure.
-//	reply := ExampleReply{}
-//
-//	// send the RPC request, wait for the reply.
-//	// the "Coordinator.Example" tells the
-//	// receiving server that we'd like to call
-//	// the Example() method of struct Coordinator.
-//	ok := call("Coordinator.Example", &args, &reply)
-//	if ok {
-//		// reply.Y should be 100.
-//		fmt.Printf("reply.Y %v\n", reply.Y)
-//	} else {
-//		fmt.Printf("call failed!\n")
-//	}
-//}
-
-// send an RPC request to the coordinator, wait for the response.
-// usually returns true.
-// returns false if something goes wrong.
+// 向coordinator发起RPC请求，然后等待回应
+// 正常情况下返回true，如果返回false，说明RPC过程出错
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()

@@ -1,16 +1,10 @@
 package mr
 
-//
 // RPC definitions.
-//
-// remember to capitalize all names.
-//
-
 import "os"
 import "strconv"
 
 // Add your RPC definitions here.
-
 type TaskType int
 
 const (

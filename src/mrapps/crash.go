@@ -20,6 +20,7 @@ import "time"
 func maybeCrash() {
 	max := big.NewInt(1000)
 	rr, _ := crand.Int(crand.Reader, max)
+	// 1/3几率直接终止程序，1/3几率休眠10s(模仿超时)，1/3几率无事
 	if rr.Int64() < 330 {
 		// crash!
 		os.Exit(1)
