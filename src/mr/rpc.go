@@ -9,21 +9,35 @@ package mr
 import "os"
 import "strconv"
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
-
-type ExampleArgs struct {
-	X int
-}
-
-type ExampleReply struct {
-	Y int
-}
-
 // Add your RPC definitions here.
 
+type TaskType int
+
+const (
+	MapTask TaskType = iota
+	ReduceTask
+	WaitTask
+	ExitTask
+)
+
+type TaskRequestArgs struct {
+}
+
+type TaskRequestReply struct {
+	TaskType TaskType // 任务的类型，Map，Reduce，Wait，Exit
+	Filename string   // 输入文件名
+	TaskId   int      //任务的ID
+	NMap     int      //Map任务的数量
+	NReduce  int      //Reduce任务的数量
+}
+
+type TaskReportArgs struct {
+	TaskType TaskType // 任务的类型，Map，Reduce，Wait，Exit
+	TaskId   int      //任务的ID
+}
+
+type TaskReportReply struct {
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
