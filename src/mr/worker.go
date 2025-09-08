@@ -215,19 +215,22 @@ func DoReduce(reduceTaskId int, nMap int, reducef func(string, []string) string)
 // 向coordinator发起RPC请求，然后等待回应
 // 正常情况下返回true，如果返回false，说明RPC过程出错
 func call(rpcname string, args interface{}, reply interface{}) bool {
-	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
+	//------1.TCP法-----------
+	//c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
+	//------2.Unix Socket法---
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
-	if err != nil {
-		log.Fatal("dialing:", err)
-	}
+
 	defer c.Close()
+	if err != nil {
+		fmt.Println(err)
+		return false
+	}
 
 	err = c.Call(rpcname, args, reply)
-	if err == nil {
-		return true
+	if err != nil {
+		fmt.Println(err)
+		return false
 	}
-
-	fmt.Println(err)
-	return false
+	return true
 }
