@@ -71,16 +71,6 @@ func init() {
 	labgob.Register(LogEntry{})
 }
 
-// Leader作为管理者，要有个账本管理，只有当选为Leader节点的才能用
-type LeaderMenu struct {
-	mu         sync.Mutex // 互斥锁，因为会随着AE修改，如果不保护，会出错
-	nextIndex  []int      //了解各个Follower的日志条目最新索引的吓一条，会随着AE的回复修正(如果冲突的话)，在Leader当选时初始化，初始都是Leader自己Log的最新index+1
-	matchIndex []int      //了解Follower日志条目的正确匹配的最新索引，初始为0，单调递增
-}
-
-// 声明一个指针类型
-var leaderMenu = &LeaderMenu{}
-
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -99,6 +89,8 @@ type Raft struct {
 	commitIndex       int         //本节点已提交日志最新的index,初始为0,单调递增
 	lastApplied       int         //本节点被应用日志最新的index,初始为0,单调递增
 	applyCh           chan ApplyMsg
+	nextIndex         []int //了解各个Follower的日志条目最新索引的吓一条，会随着AE的回复修正(如果冲突的话)，在Leader当选时初始化，初始都是Leader自己Log的最新index+1
+	matchIndex        []int //了解Follower日志条目的正确匹配的最新索引，初始为0，单调递增
 }
 
 // return currentTerm and whether this server
@@ -375,56 +367,15 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 	if reply.Success {
 		//如果推送日志，对面成功接收了
-		//那就可以更新leaderMenu了
-		leaderMenu.mu.Lock()
-		leaderMenu.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
-		leaderMenu.nextIndex[server] = leaderMenu.matchIndex[server] + 1
-		leaderMenu.mu.Unlock()
-		//尝试推进commitIndex
-		rf.tryAdvanceCommitIndex()
+		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+		rf.nextIndex[server] = rf.matchIndex[server] + 1
 	} else {
 		//如果推送日志，对面拒绝了，那说明有冲突
-		//要修改leaderMenu
-		leaderMenu.mu.Lock()
-		if leaderMenu.nextIndex[server] > 1 {
-			leaderMenu.nextIndex[server]--
+		if rf.nextIndex[server] > 1 {
+			rf.nextIndex[server]--
 		}
-		leaderMenu.mu.Unlock()
 	}
 	return true
-}
-
-func (rf *Raft) tryAdvanceCommitIndex() {
-	//从当前commitIndex+1开始，向后找可以提交的最高index
-	// *****************----
-	// *是已提交的，-是还没提交的，总长度是len(rf.logEntries)
-	// 本方法就是通过matchIndex来看，leader的commitIndex
-	for N := rf.commitIndex + 1; N < len(rf.logEntries); N++ {
-		if rf.logEntries[N].Term != rf.currentTerm {
-			continue //只提交当前任期的日志，论文要求
-		}
-
-		count := 1
-		leaderMenu.mu.Lock()
-		for i := range rf.peers {
-			//自己不算，已经+1了
-			if i == rf.me {
-				continue
-			}
-			//排除自己的前提下，如果有人的匹配索引比本N高
-			if leaderMenu.matchIndex[i] >= N {
-				count++
-			}
-		}
-		leaderMenu.mu.Unlock()
-		//取得多数了，可以把commitIndex推到这个N
-		if count*2 > len(rf.peers) {
-			rf.commitIndex = N
-			go rf.applyLogs()
-		} else {
-			break
-		}
-	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -443,86 +394,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.role != Leader {
-		return -1, rf.currentTerm, false
-	}
-	//本节点是Leader,现在来了个条命令，要把它存到日志里
-	//先编码为字节数组
-	var buf bytes.Buffer
-	encoder := labgob.NewEncoder(&buf)
-	err := encoder.Encode(command)
-	if err != nil {
-		return -1, rf.currentTerm, false
-	}
-	//然后创建日志条目
-	entry := &LogEntry{
-		Term:    rf.currentTerm,
-		Command: buf.Bytes(),
-	}
-	index := len(rf.logEntries)
-	//先添加到自己的日志上
-	rf.logEntries = append(rf.logEntries, entry)
-	//然后把这条日志条目复制到Followers的日志上
-	go rf.replicateLog(index)
-	return index, rf.currentTerm, true
-}
-
-// Leader向Followers推送日志
-func (rf *Raft) replicateLog(startIndex int) {
-	for {
-		//只有Leader有资格复制日志，有可能刚执行replicateLog时，就触发选举，换人了，所以在这判断一下
-		rf.mu.Lock()
-		if rf.role != Leader {
-			rf.mu.Unlock()
-			return
-		}
-		leaderMenu.mu.Lock()
-		nextIndex := make([]int, len(rf.peers))
-		copy(nextIndex, leaderMenu.nextIndex)
-		leaderMenu.mu.Unlock()
-
-		var wg sync.WaitGroup
-		for i := range rf.peers {
-			//自己不用给自己发
-			if i == rf.me {
-				continue
-			}
-			prevIndex := nextIndex[i] - 1
-			//要对prevIndex判断一下
-			if prevIndex < 0 || prevIndex >= len(rf.logEntries) {
-				//这个Follower的prevIndex不对，跳过
-				rf.mu.Unlock()
-				continue
-			}
-			args := &AppendEntriesArgs{
-				Term:         rf.currentTerm,
-				LeaderId:     rf.me,
-				PrevLogIndex: prevIndex,
-				PrevLogTerm:  rf.logEntries[prevIndex].Term,
-				Entries:      rf.logEntries[nextIndex[i]:],
-				LeaderCommit: rf.commitIndex,
-			}
-			wg.Add(1)
-			go func(server int) {
-				defer wg.Done()
-				var reply AppendEntriesReply
-				if rf.sendAppendEntries(server, args, &reply) {
-
-				}
-			}(i)
-		}
-		//等都执行完了再说
-		rf.mu.Unlock()
-		wg.Wait()
-
-		rf.mu.Lock()
-		if rf.commitIndex >= startIndex {
-			rf.mu.Unlock()
-			break
-		}
-		rf.mu.Unlock()
-		time.Sleep(10 * time.Millisecond)
-	}
+	return 0, 0, false
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -611,14 +483,12 @@ func (rf *Raft) startElection() {
 						rf.role = Leader
 						go rf.broadcastHeartbeats()
 						//初始化leaderMenu
-						leaderMenu.mu.Lock()
-						leaderMenu.nextIndex = make([]int, len(rf.peers))
-						leaderMenu.matchIndex = make([]int, len(rf.peers))
-						for i := range leaderMenu.nextIndex {
-							leaderMenu.nextIndex[i] = len(rf.logEntries)
-							leaderMenu.matchIndex[i] = 0
+						rf.nextIndex = make([]int, len(rf.peers))
+						rf.matchIndex = make([]int, len(rf.peers))
+						for i := range rf.nextIndex {
+							rf.nextIndex[i] = len(rf.logEntries)
+							rf.matchIndex[i] = 0
 						}
-						leaderMenu.mu.Unlock()
 					}
 				} else if reply.Term > rf.currentTerm {
 					//没同时满足上述，而且对方的Term比我大，本着Term大的优先，所以我变成Follower
