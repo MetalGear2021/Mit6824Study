@@ -91,16 +91,15 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	currentTerm       int        // 最新的任期，初始为0，然后单调递增
-	votedFor          int        // 在最新的任期里，给哪个候选人投票
-	role              Role       // 本server的角色，是leader还是follower还是candidates
-	lastHeartbeatTime time.Time  // 上次接收到心跳的时间
-	logEntries        []LogEntry //每个Raft节点记录的日志条目表
-	commitIndex       int        //本节点已提交日志最新的index,初始为0,单调递增
-	lastApplied       int        //本节点被应用日志最新的index,初始为0,单调递增
-	applyCh           chan ApplyMsg
-	nextIndex         []int //了解各个Follower的日志条目最新索引的吓一条，会随着AE的回复修正(如果冲突的话)，在Leader当选时初始化，初始都是Leader自己Log的最新index+1
-	matchIndex        []int //了解Follower日志条目的正确匹配的最新索引，初始为0，单调递增
+	currentTerm int        // 最新的任期，初始为0，然后单调递增
+	votedFor    int        // 在最新的任期里，给哪个候选人投票
+	role        Role       // 本server的角色，是leader还是follower还是candidates
+	logEntries  []LogEntry //每个Raft节点记录的日志条目表
+	commitIndex int        //本节点已提交日志最新的index,初始为0,单调递增
+	lastApplied int        //本节点被应用日志最新的index,初始为0,单调递增
+	applyCh     chan ApplyMsg
+	nextIndex   []int //了解各个Follower的日志条目最新索引的吓一条，会随着AE的回复修正(如果冲突的话)，在Leader当选时初始化，初始都是Leader自己Log的最新index+1
+	matchIndex  []int //了解Follower日志条目的正确匹配的最新索引，初始为0，单调递增
 
 	overtime time.Duration // 设置超时时间，200-400ms
 	timer    *time.Ticker  // 每个节点中的计时器
@@ -242,7 +241,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.Term = rf.currentTerm
 			reply.VoteState = Normal
 
-			//rf.lastHeartbeatTime = time.Now()
 			rf.timer.Reset(rf.overtime)
 		} else {
 			//已经投票了
@@ -255,7 +253,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				//投的就是args的候选人，但因为网络问题，重发了
 				rf.role = Follower
 			}
-			//rf.lastHeartbeatTime = time.Now()
 			rf.timer.Reset(rf.overtime)
 		}
 	}
@@ -343,11 +340,123 @@ type AppendEntriesReply struct {
 	UpNextIndex int                //告诉Leader，本Follower更新日志的nextIndex
 }
 
+//func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+//	rf.mu.Lock()
+//	defer rf.mu.Unlock()
+//
+//	// 检查节点状态
+//	if rf.killed() {
+//		reply.AppState = AppKilled
+//		reply.Term = -1
+//		reply.Success = false
+//		return
+//	}
+//
+//	// 1. 任期检查
+//	if args.Term < rf.currentTerm {
+//		reply.AppState = AppOutOfDate
+//		reply.Term = rf.currentTerm
+//		reply.Success = false
+//		return
+//	}
+//
+//	// 更新任期并转换为 follower
+//	if args.Term > rf.currentTerm {
+//		rf.currentTerm = args.Term
+//		rf.votedFor = -1
+//		rf.role = Follower
+//	}
+//
+//	// 重置心跳计时器
+//	rf.timer.Reset(rf.overtime)
+//
+//	// 2. 日志一致性检查
+//	if args.PrevLogIndex > 0 {
+//		// 检查 PrevLogIndex 是否超出范围
+//		if args.PrevLogIndex > len(rf.logEntries) {
+//			reply.AppState = Mismatch
+//			reply.Term = rf.currentTerm
+//			reply.Success = false
+//			reply.UpNextIndex = len(rf.logEntries) + 1
+//			return
+//		}
+//
+//		// 检查任期是否匹配
+//		if args.PrevLogIndex-1 < len(rf.logEntries) &&
+//			rf.logEntries[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+//			reply.AppState = Mismatch
+//			reply.Term = rf.currentTerm
+//			reply.Success = false
+//
+//			// 找到冲突任期的第一个索引
+//			conflictTerm := rf.logEntries[args.PrevLogIndex-1].Term
+//			conflictIndex := args.PrevLogIndex
+//			for i := args.PrevLogIndex - 1; i >= 0; i-- {
+//				if rf.logEntries[i].Term != conflictTerm {
+//					break
+//				}
+//				conflictIndex = i + 1
+//			}
+//			reply.UpNextIndex = conflictIndex
+//			return
+//		}
+//	}
+//
+//	// 3. 追加日志条目
+//	if len(args.Entries) > 0 {
+//		// 删除冲突的日志条目并追加新条目
+//		insertIndex := args.PrevLogIndex
+//		for i, entry := range args.Entries {
+//			logIndex := insertIndex + i
+//			if logIndex < len(rf.logEntries) {
+//				if rf.logEntries[logIndex].Term != entry.Term {
+//					// 发现冲突，截断日志
+//					rf.logEntries = rf.logEntries[:logIndex]
+//					rf.logEntries = append(rf.logEntries, args.Entries[i:]...)
+//					break
+//				}
+//			} else {
+//				// 追加新条目
+//				rf.logEntries = append(rf.logEntries, args.Entries[i:]...)
+//				break
+//			}
+//		}
+//	}
+//
+//	// 4. 更新提交索引
+//	if args.LeaderCommit > rf.commitIndex {
+//		min := func(a, b int) int {
+//			if a < b {
+//				return a
+//			}
+//			return b
+//		}
+//		newCommit := min(args.LeaderCommit, len(rf.logEntries))
+//		if newCommit > rf.commitIndex {
+//			// 应用新提交的日志
+//			for i := rf.commitIndex + 1; i <= newCommit; i++ {
+//				applyMsg := ApplyMsg{
+//					CommandValid: true,
+//					CommandIndex: i,
+//					Command:      rf.logEntries[i-1].Command,
+//				}
+//				rf.applyCh <- applyMsg
+//			}
+//			rf.commitIndex = newCommit
+//			rf.lastApplied = newCommit
+//		}
+//	}
+//
+//	reply.AppState = AppNormal
+//	reply.Term = rf.currentTerm
+//	reply.Success = true
+//	reply.UpNextIndex = len(rf.logEntries) + 1
+//}
+
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// 检查节点状态
 	if rf.killed() {
 		reply.AppState = AppKilled
 		reply.Term = -1
@@ -355,7 +464,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// 1. 任期检查
+	// 任期检查
 	if args.Term < rf.currentTerm {
 		reply.AppState = AppOutOfDate
 		reply.Term = rf.currentTerm
@@ -363,19 +472,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// 更新任期并转换为 follower
+	// 如果对方term更大，更新自身状态
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.role = Follower
+		rf.persist()
 	}
 
-	// 重置心跳计时器
+	// 重置计时器
 	rf.timer.Reset(rf.overtime)
 
-	// 2. 日志一致性检查
+	// 日志一致性检查
 	if args.PrevLogIndex > 0 {
-		// 检查 PrevLogIndex 是否超出范围
+		// 检查PrevLogIndex是否超出范围
 		if args.PrevLogIndex > len(rf.logEntries) {
 			reply.AppState = Mismatch
 			reply.Term = rf.currentTerm
@@ -385,13 +495,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 
 		// 检查任期是否匹配
-		if args.PrevLogIndex-1 < len(rf.logEntries) &&
-			rf.logEntries[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+		if rf.logEntries[args.PrevLogIndex-1].Term != args.PrevLogTerm {
 			reply.AppState = Mismatch
 			reply.Term = rf.currentTerm
 			reply.Success = false
 
-			// 找到冲突任期的第一个索引
+			// 优化冲突处理，找到冲突任期的第一个索引
 			conflictTerm := rf.logEntries[args.PrevLogIndex-1].Term
 			conflictIndex := args.PrevLogIndex
 			for i := args.PrevLogIndex - 1; i >= 0; i-- {
@@ -405,10 +514,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
-	// 3. 追加日志条目
+	// 追加日志条目
+	newEntriesAdded := false
 	if len(args.Entries) > 0 {
-		// 删除冲突的日志条目并追加新条目
 		insertIndex := args.PrevLogIndex
+		// 检查是否有冲突
 		for i, entry := range args.Entries {
 			logIndex := insertIndex + i
 			if logIndex < len(rf.logEntries) {
@@ -416,25 +526,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					// 发现冲突，截断日志
 					rf.logEntries = rf.logEntries[:logIndex]
 					rf.logEntries = append(rf.logEntries, args.Entries[i:]...)
+					newEntriesAdded = true
 					break
 				}
 			} else {
 				// 追加新条目
 				rf.logEntries = append(rf.logEntries, args.Entries[i:]...)
+				newEntriesAdded = true
 				break
 			}
 		}
+		if newEntriesAdded {
+			rf.persist()
+		}
 	}
 
-	// 4. 更新提交索引
+	// 更新提交索引
 	if args.LeaderCommit > rf.commitIndex {
-		min := func(a, b int) int {
-			if a < b {
-				return a
-			}
-			return b
+		newCommit := args.LeaderCommit
+		if newCommit > len(rf.logEntries) {
+			newCommit = len(rf.logEntries)
 		}
-		newCommit := min(args.LeaderCommit, len(rf.logEntries))
 		if newCommit > rf.commitIndex {
 			// 应用新提交的日志
 			for i := rf.commitIndex + 1; i <= newCommit; i++ {
@@ -536,41 +648,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 				return
 			}
 
-			// 从当前 commitIndex+1 开始，向后找最大的 N，使得：
-			// 1. log[N].term == currentTerm
-			// 2. 大多数节点的 matchIndex[i] >= N
-			for N := rf.commitIndex + 1; N <= len(rf.logEntries); N++ {
-				if rf.logEntries[N-1].Term != rf.currentTerm {
-					continue // 只考虑当前任期的日志
-				}
-
-				count := 1 // 自己
-				for i := range rf.peers {
-					if i != rf.me && rf.matchIndex[i] >= N {
-						count++
-					}
-				}
-
-				if count > len(rf.peers)/2 {
-					// 可以提交到 N
-					oldCommit := rf.commitIndex
-					rf.commitIndex = N
-
-					// 应用从 oldCommit+1 到 N 的所有日志
-					for idx := oldCommit + 1; idx <= rf.commitIndex; idx++ {
-						applyMsg := ApplyMsg{
-							CommandValid: true,
-							CommandIndex: idx,
-							Command:      rf.logEntries[idx-1].Command,
-						}
-						rf.applyCh <- applyMsg
-					}
-					rf.lastApplied = rf.commitIndex // 保持一致
-				} else {
-					// 一旦某个 N 不满足，后面的也不用检查了（因为 matchIndex 是递增的）
-					break
-				}
-			}
+			rf.updateCommitIndex()
 		}
 	}
 	return
@@ -806,6 +884,44 @@ func (rf *Raft) ticker() {
 			rf.mu.Unlock()
 		}
 
+	}
+}
+
+func (rf *Raft) updateCommitIndex() {
+	// 从当前 commitIndex+1 开始，向后找最大的 N，使得：
+	// 1. log[N].term == currentTerm
+	// 2. 大多数节点的 matchIndex[i] >= N
+	for N := rf.commitIndex + 1; N <= len(rf.logEntries); N++ {
+		if rf.logEntries[N-1].Term != rf.currentTerm {
+			continue // 只考虑当前任期的日志
+		}
+
+		count := 1 // 自己
+		for i := range rf.peers {
+			if i != rf.me && rf.matchIndex[i] >= N {
+				count++
+			}
+		}
+
+		if count > len(rf.peers)/2 {
+			// 可以提交到 N
+			oldCommit := rf.commitIndex
+			rf.commitIndex = N
+
+			// 应用从 oldCommit+1 到 N 的所有日志
+			for idx := oldCommit + 1; idx <= rf.commitIndex; idx++ {
+				applyMsg := ApplyMsg{
+					CommandValid: true,
+					CommandIndex: idx,
+					Command:      rf.logEntries[idx-1].Command,
+				}
+				rf.applyCh <- applyMsg
+			}
+			rf.lastApplied = rf.commitIndex // 保持一致
+		} else {
+			// 一旦某个 N 不满足，后面的也不用检查了（因为 matchIndex 是递增的）
+			break
+		}
 	}
 }
 
