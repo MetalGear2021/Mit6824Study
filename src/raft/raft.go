@@ -18,7 +18,9 @@ package raft
 //
 
 import (
+	"6.824/labgob"
 	"6.824/labrpc"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -100,12 +102,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -115,17 +118,20 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		panic("fail to decode state")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -194,6 +200,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	// 满足限制，可以投票
 	rf.votedFor = args.CandidateId
+	rf.persist()
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = true
 	// reset timer after grant vote
@@ -213,6 +220,22 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  //currentTerm, for leader to update itself
 	Success bool //true if follower contained entry matching prevLogIndex and prevLogTerm
+
+	//Figure 8: A time sequence showing why a leader cannot determine commitment using log entries from older terms. In
+	// (a) S1 is leader and partially replicates the log entry at index
+	// 2. In (b) S1 crashes; S5 is elected leader for term 3 with votes
+	// from S3, S4, and itself, and accepts a different entry at log
+	// index 2. In (c) S5 crashes; S1 restarts, is elected leader, and
+	// continues replication. At this point, the log entry from term 2
+	// has been replicated on a majority of the servers, but it is not
+	// committed. If S1 crashes as in (d), S5 could be elected leader
+	// (with votes from S2, S3, and S4) and overwrite the entry with
+	// its own entry from term 3. However, if S1 replicates an entry from its current term on a majority of the servers before
+	// crashing, as in (e), then this entry is committed (S5 cannot
+	// win an election). At this point all preceding entries in the log
+	// are committed as well.
+	ConflictTerm  int // 2C
+	ConflictIndex int // 2C
 }
 
 // 接收到Leader的日志推送
@@ -242,10 +265,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 	lastLogIndex := rf.getLastLogIndex()
-	// 我的日志偏少了
+	// 我的日志偏少了,不一致
 	if lastLogIndex < args.PrevLogIndex {
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		// (quick fallback)
+		// optimistically thinks receiver's log matches with Leader's as a subset
+		// 往好的想，Follower 有可能是Leader的一个子集
+		reply.ConflictIndex = len(rf.log)
+		// no conflict term  没冲突的Term
+		reply.ConflictTerm = -1
 		return
 	}
 
@@ -255,6 +284,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.log[(args.PrevLogIndex)].Term != args.PrevLogTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		// (quick fallback)
+		// receiver's log in certain term unmatches Leader's log
+		// Term冲突了，把自己最后一个节点的Term发给Leader
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+
+		// expecting Leader to check the former term
+		// so set ConflictIndex to the first one of entries in ConflictTerm
+		// 初始冲突的索引就是args.PrevLogIndex，但不能排除前面的日志也冲突
+		conflictIndex := args.PrevLogIndex
+		// apparently, since rf.log[0] are ensured to match among all servers
+		// ConflictIndex must be > 0, safe to minus 1
+		// 上一个日志的term不符合，那么前面一样Term的日志大概率也是不对的，把conflictIndex往后退
+		for rf.log[conflictIndex-1].Term == reply.ConflictTerm {
+			conflictIndex--
+		}
+		reply.ConflictIndex = conflictIndex
 		return
 	}
 
@@ -262,7 +307,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 4. Append any new entries not already in the log compare from rf.log[args.PrevLogIndex + 1]
 	rf.log = rf.log[:(args.PrevLogIndex + 1)] //截取一致的日志，因为分片左闭右开，要保留PrevLogIndex，所以+1
 	rf.log = append(rf.log, args.Entries...)  //然后把Entries追加
-
+	rf.persist()
 	//5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	// 一致性判断，Leader的CommitIndex和我的commitIndex中最小值，是我的新commitIndex
 	if args.LeaderCommit > rf.commitIndex {
@@ -341,6 +386,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		//如果是Leader，就把此命令转为条目，然后加入日志
 		logEntry := LogEntry{Command: command, Term: term}
 		rf.log = append(rf.log, logEntry)
+		rf.persist()
 		rf.matchIndex[rf.me] = rf.getLastLogIndex()
 		rf.nextIndex[rf.me] = rf.matchIndex[rf.me] + 1
 		index = rf.matchIndex[rf.me] //这个条目存储的索引
@@ -420,6 +466,7 @@ func (rf *Raft) switchStateTo(state int) {
 			rf.nextIndex[i] = rf.getLastLogIndex() + 1
 			rf.matchIndex[i] = 0
 		}
+		rf.votedFor = -1
 		rf.heartbeats()
 		rf.heartbeatTimer.Reset(HEART_BEAT_TIMEOUT * time.Millisecond)
 	}
@@ -511,10 +558,25 @@ func (rf *Raft) heartbeat(server int) {
 				//对方term比我高，那我这个Leader过期了，所以我要转变为Follower
 				rf.currentTerm = reply.Term
 				rf.switchStateTo(Follower)
+				rf.persist()
 			} else {
 				// 它之前的日志跟我的对应的不一致，所以要降低它的nextIndex，直到一致，然后就能把后面不一致的一口气推过去
 				// 这里也是性能优化点，如果有1000条日志不一致，那就得呼叫1000次RPC
-				rf.nextIndex[server]--
+				//rf.nextIndex[server]--
+				// (quick fallback)
+				rf.nextIndex[server] = reply.ConflictIndex
+				// if term found, override it to
+				// the first entry after entries in ConflictTerm
+				if reply.ConflictTerm != -1 {
+					for i := args.PrevLogIndex; i >= 1; i-- {
+						if rf.log[i-1].Term == reply.ConflictTerm {
+							// in next trial, check if log entries in ConflictTerm matches
+							//从后往前遍历log，找到第一条匹配的
+							rf.nextIndex[server] = i
+							break
+						}
+					}
+				}
 			}
 		}
 		rf.mu.Unlock()
@@ -524,8 +586,9 @@ func (rf *Raft) heartbeat(server int) {
 // 开始选举，调用者需要加锁
 func (rf *Raft) startElection() {
 	DPrintf("raft%v is starting election\n", rf.me)
-	rf.currentTerm += 1                         //term自增1
-	rf.votedFor = rf.me                         //自己给你投票
+	rf.currentTerm += 1 //term自增1
+	rf.votedFor = rf.me //自己给你投票
+	rf.persist()
 	voteCount := 1                              //投票数，初始为1，因为自己给自己投了一票
 	rf.heartbeatTimer.Reset(randTimeDuration()) //发起投票，重置计时器
 
@@ -554,6 +617,7 @@ func (rf *Raft) startElection() {
 				if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
 					rf.switchStateTo(Follower)
+					rf.persist()
 				}
 				if reply.VoteGranted && rf.state == Candidate {
 					voteCount++
