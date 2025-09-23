@@ -85,7 +85,7 @@ type Raft struct {
 
 	// 辅助数据
 	heartbeatTimer *time.Timer   // 心跳定时器
-	state          int           // 角色
+	role           int           // 角色
 	applyCh        chan ApplyMsg // 提交通道
 	cond           *sync.Cond    //条件变量，用于通知applier
 
@@ -101,7 +101,6 @@ type Raft struct {
 	snapShot          []byte //存储的快照
 	lastIncludedIndex int    //日志中最新条目的索引
 	lastIncludedTerm  int    //日志中最新条目的Term
-	voteCount         int
 }
 
 // (2D)
@@ -137,7 +136,7 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	term := rf.currentTerm
-	isleader := rf.state == Leader
+	isleader := rf.role == Leader
 	return term, isleader
 }
 
@@ -270,47 +269,44 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("Candidate[raft%v][term:%v] request vote: raft%v[%v] 's term%v\n", args.CandidateId, args.Term, rf.me, rf.state, rf.currentTerm)
-	if args.Term < rf.currentTerm ||
-		(args.Term == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidateId) {
-		//已经投给别人
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
-		return
-	}
-	if args.Term == rf.currentTerm && rf.state == Leader {
-		//解决脑裂问题撒手锏
-		//在这个任期里，我已经是Leader了，就不能给别人投票
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
-		return
-	}
+	DPrintf("Candidate[raft%v][term:%v] request vote: raft%v[%v] 's term%v\n", args.CandidateId, args.Term, rf.me, rf.role, rf.currentTerm)
+	// reset timer after grant vote 投票要重置，防止多余选举
+	rf.heartbeatTimer.Reset(randTimeDuration())
 
+	//初始reply，默认失败
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+
+	// 1.候选人落伍了，不投票
+	if args.Term < rf.currentTerm {
+		return
+	}
+	// 2.已经投给别人了，不投票
+	if args.Term == rf.currentTerm && rf.votedFor != -1 {
+		return
+	}
+	// 3.解决脑裂问题撒手锏,在这个任期里，我已经是Leader了，不能给别人投票
+	if args.Term == rf.currentTerm && rf.role == Leader {
+		return
+	}
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
-		rf.switchStateTo(Follower)
+		rf.switchRoleTo(Follower)
 	}
 
 	// 2B: candidate's vote should be at least up-to-date as receiver's log "up-to-date" is defined in thesis 5.4.1
-	// 投票限制，必须日志够新的节点才有资格当选，防止一颗老鼠屎污染一锅汤
+	// 4.投票限制，必须日志够新的节点才有资格当选，防止一颗老鼠屎污染一锅汤
 	lastLogIndex := rf.getLastLogIndex() //本日志的最后一条的索引
 	lastLogTerm := rf.log[rf.RealLogIdx(lastLogIndex)].Term
-	if args.LastLogTerm < lastLogTerm ||
-		(args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex) {
-		// Receiver is more up-to-date, does not grant vote
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
+	// Receiver is more up-to-date, does not grant vote 候选人日志落后了，不投票
+	if args.LastLogTerm < lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex) {
 		return
 	}
-	// 满足限制，可以投票
+	//-----------满足各种限制，可以投票--------------
+	DPrintf("[选举日志][term %v] server %v 投票 %v in  \n", rf.currentTerm, rf.me, args.CandidateId)
 	rf.votedFor = args.CandidateId
-	//fmt.Printf("[选举日志] server %v 投票 %v in term %v \n", rf.me, args.CandidateId, rf.currentTerm)
 	rf.persist()
-	reply.Term = rf.currentTerm
 	reply.VoteGranted = true
-	// reset timer after grant vote
-	// 投票后要重置，防止多余选举
-	rf.heartbeatTimer.Reset(randTimeDuration())
 }
 
 type AppendEntriesArgs struct {
@@ -347,38 +343,31 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("leader[raft%v][term:%v] beat term:%v [raft%v][%v]\n", args.LeaderId, args.Term, rf.currentTerm, rf.me, rf.state)
-	reply.Success = true
-	//------我收到了Leader的日志推送------
-
-	if rf.lastIncludedIndex > args.PrevLogIndex /*对等点的快照点已经超过本次日志复制的点，没有必要接受此日志复制rpc了*/ {
-		reply.Term, reply.Success = rf.currentTerm, false
-		return
-	}
-
-	// 1. Reply false if term < currentTerm (§5.1)
-	// 如果Leader的term还没我高，拒绝
-	if args.Term < rf.currentTerm {
-		reply.Success = false
-		reply.Term = rf.currentTerm //把我的Term返回
-		return
-	}
-	//If RPC request or response contains term T > currentTerm:set currentTerm = T, convert to follower (§5.1)
-	// 我没Leader的高，那无论我原来是什么角色，现在都变成Follower
+	DPrintf("[同步日志][term:%v] %v %v收到来自term %v leader%v的日志推送\n", rf.currentTerm, rf.role, rf.me, args.Term, args.LeaderId)
+	// reset election timer even log does not match args.LeaderId is the current term's Leader 就算没成功，只要收到AE，就重置计时器
+	rf.heartbeatTimer.Reset(randTimeDuration())
+	//If RPC request or response contains term T > currentTerm:set currentTerm = T, convert to follower (§5.1) 我落伍了，无论我原来是什么，现在都成为Follower
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
-		rf.switchStateTo(Follower)
+		rf.switchRoleTo(Follower)
 	}
-	// reset election timer even log does not match args.LeaderId is the current term's Leader
-	// 重置计时器
-	rf.heartbeatTimer.Reset(randTimeDuration())
+	//初始reply，默认失败
+	reply.Term = rf.currentTerm
+	reply.Success = false
 
-	// 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
-	lastLogIndex := rf.getLastLogIndex()
-	// 我的日志偏少了,不一致
-	if lastLogIndex < args.PrevLogIndex {
-		reply.Success = false
-		reply.Term = rf.currentTerm
+	// 本节点对于的快照点已经超过本次日志复制的点，没必要接受此日志复制
+	if rf.lastIncludedIndex > args.PrevLogIndex {
+		return
+	}
+
+	// Reply false if term < currentTerm (§5.1)如果Leader的term还没我高，拒绝
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
+	// 我的日志偏少了,那肯定不一致
+	if rf.getLastLogIndex() < args.PrevLogIndex {
 		// (quick fallback)
 		// optimistically thinks receiver's log matches with Leader's as a subset
 		// 往好的想，Follower 有可能是Leader的一个子集
@@ -387,44 +376,36 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.ConflictTerm = -1
 		return
 	}
-
-	// 3. If an existing entry conflicts with a new one (same index but different terms),
-	// delete the existing entry and all that follow it (§5.3)
+	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 	// 上一个日志条目，索引匹配，但Term不匹配，所以本次追加不能通过，因为上一个都不一致，后面追加新的也没用
 	if rf.log[rf.RealLogIdx(args.PrevLogIndex)].Term != args.PrevLogTerm {
-		reply.Success = false
-		reply.Term = rf.currentTerm
 		// (quick fallback)
-		// receiver's log in certain term unmatches Leader's log
 		// Term冲突了，把自己最后一个节点的Term发给Leader
 		reply.ConflictTerm = rf.log[rf.RealLogIdx(args.PrevLogIndex)].Term
-
-		// expecting Leader to check the former term
-		// so set ConflictIndex to the first one of entries in ConflictTerm
+		// expecting Leader to check the former term,so set ConflictIndex to the first one of entries in ConflictTerm
 		// 初始冲突的索引就是args.PrevLogIndex，但不能排除前面的日志也冲突
 		conflictIndex := args.PrevLogIndex
-		// apparently, since rf.log[0] are ensured to match among all servers
-		// ConflictIndex must be > 0, safe to minus 1
-		// 上一个日志的term不符合，那么前面一样Term的日志大概率也是不对的，把conflictIndex往后退
+		// apparently, since rf.log[0] are ensured to match among all servers;ConflictIndex must be > 0, safe to minus 1
+		// 上一个日志的term不符合，那么前面一样Term的日志大概率也是不对的，把conflictIndex往后退,但也要保证把conflictIndex的实际索引最低为1
 		for rf.RealLogIdx(conflictIndex-1) >= 0 && rf.log[rf.RealLogIdx(conflictIndex-1)].Term == reply.ConflictTerm {
 			conflictIndex--
 		}
 		reply.ConflictIndex = conflictIndex
 		return
 	}
-	//fmt.Printf("server %v 应用日志的index %v \n", rf.me, args.PrevLogTerm)
-	// 能通过之前的判断，说明我和Leader在PrevLogIndex上的日志以及之前的日志都是一致的，那么就可以在后面添加新日志了
+	DPrintf("[同步日志][term:%v] %v %v应用来自term %v leader%v的日志推送\n", rf.currentTerm, rf.role, rf.me, args.Term, args.LeaderId)
+	// 能通过之前的判断，说明我和Leader在PrevLogIndex以及之前的日志都是一致的，那么就可以在后面添加新日志了
+	// 3. If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it (§5.3)
 	// 4. Append any new entries not already in the log compare from rf.log[args.PrevLogIndex + 1]
 	rf.log = rf.log[:rf.RealLogIdx(args.PrevLogIndex+1)] //截取一致的日志，因为分片左闭右开，要保留PrevLogIndex，所以+1
 	rf.log = append(rf.log, args.Entries...)             //然后把Entries追加
-	rf.persist()
+	rf.persist()                                         //改动了rf.log，要持久化
 	//5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	// 一致性判断，Leader的CommitIndex和我的commitIndex中最小值，是我的新commitIndex
-	if rf.lastIncludedIndex < args.LeaderCommit && args.LeaderCommit > rf.commitIndex {
+	if rf.lastIncludedIndex < args.LeaderCommit && rf.commitIndex < args.LeaderCommit {
 		// 如果直接等于LeaderCommit，会通不过2C实验
 		rf.setCommitIndex(min(args.LeaderCommit, rf.getLastLogIndex()))
 	}
-
 	reply.Success = true
 }
 
@@ -483,7 +464,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.currentTerm = args.Term
 		DPrintf("server %v 接收来自 leader %v 的InstallSnapshot，且发现更大的Term", rf.me, args.LeaderId)
 	}
-	rf.switchStateTo(Follower) //强转为Follower，注意这和AE不一样，AE不会强转为
+	rf.switchRoleTo(Follower) //强转为Follower，注意这和AE不一样，AE不会强转为
 	rf.votedFor = args.LeaderId
 
 	//6.If existing Log entry has same index and term as snapshot`s last included entry,retain log entries following it and reply
@@ -595,7 +576,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	index := -1
 	term := rf.currentTerm
-	isLeader := rf.state == Leader
+	isLeader := rf.role == Leader
 
 	if isLeader {
 		//如果是Leader，就把此命令转为条目，然后加入日志
@@ -640,11 +621,12 @@ func (rf *Raft) ticker() {
 		select {
 		case <-rf.heartbeatTimer.C:
 			rf.mu.Lock()
-			switch rf.state {
+			switch rf.role {
 			case Follower:
-				rf.switchStateTo(Candidate)
+				rf.switchRoleTo(Candidate)
 			case Candidate:
 				rf.startElection()
+				rf.heartbeatTimer.Reset(randTimeDuration()) //发起投票，重置计时器
 			case Leader:
 				//Leader到时了，群发心跳，并重置计时器
 				rf.heartbeats()
@@ -660,95 +642,93 @@ func randTimeDuration() time.Duration {
 }
 
 // 切换状态，调用者需要加锁
-func (rf *Raft) switchStateTo(state int) {
+func (rf *Raft) switchRoleTo(role int) {
 	// 如果已经是想转变的状态了，不用重复操作
-	if state == rf.state {
+	if role == rf.role {
 		return
 	}
-	DPrintf("Term %d: server %d convert from %v to %v\n", rf.currentTerm, rf.me, rf.state, state)
-	rf.state = state
-	switch state {
+	DPrintf("Term %d: server %d convert from %v to %v\n", rf.currentTerm, rf.me, rf.role, role)
+	rf.role = role
+	switch role {
 	case Follower:
 		rf.votedFor = -1
 		rf.heartbeatTimer.Reset(randTimeDuration())
 	case Candidate:
-		// 成为候选人后立马进行选举
+		// 成为候选人后立马进行选举,并重置计时器
 		rf.startElection()
+		rf.heartbeatTimer.Reset(randTimeDuration())
 	case Leader:
-		// 当选后，要重置nextIndex和matchIndex
-		//fmt.Printf("[选举日志] server %d 成功当选 in Term %d \n", rf.me, rf.currentTerm)
+		// 当选后，要重置nextIndex和matchIndex,并重置计时器
+		DPrintf("[选举日志] server %d 成功当选 in Term %d \n", rf.me, rf.currentTerm)
 		for i := range rf.peers {
 			rf.nextIndex[i] = rf.getLastLogIndex() + 1 // initialized to leader last log index + 1
 			rf.matchIndex[i] = rf.lastIncludedIndex    //知道lastIncluedIndex，就能快速知道matchIndex
 		}
-		rf.votedFor = -1
 		rf.heartbeats()
 		rf.heartbeatTimer.Reset(HEART_BEAT_TIMEOUT * time.Millisecond)
 	}
 }
 
-// 发送心跳包，调用者需要加锁
+// 群发心跳，调用者需要加锁
 func (rf *Raft) heartbeats() {
-	for i := range rf.peers {
-		//不用发给自己
-		if i == rf.me {
+	for server := range rf.peers {
+		// 不用发给自己
+		if server == rf.me {
 			continue
 		}
-		go rf.heartbeat(i)
-	}
-}
+		// 向指定server推送日志
+		go func(server int) {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if rf.role != Leader {
+				// 只有Leader才能推日志
+				return
+			}
+			// 根据账本记录，找到server的最后一条日志条目，那就是nextIndex减一
+			prevLogIndex := rf.nextIndex[server] - 1
+			//(2D)，判断是要推送日志还是推送快照
+			DPrintf("PrevLogIndex是 %v ;lastIncludedIndex是%v \n", prevLogIndex, rf.lastIncludedIndex)
+			if prevLogIndex < rf.lastIncludedIndex {
+				// 发现Follower已经落后于快照点，那直接推送快照
+				DPrintf("leader %v 向 server %v 发送sendInstallSnapshot, lastIncludedIndex=%v, nextIndex[%v]=%v \n", rf.me, server, rf.lastIncludedIndex, server, rf.nextIndex[server])
+				args := InstallSnapshotArgs{
+					Term:              rf.currentTerm,
+					LeaderId:          rf.me,
+					LastIncludedIndex: rf.lastIncludedIndex,
+					LastIncludedTerm:  rf.lastIncludedTerm,
+					Data:              rf.snapShot,
+					LastIncluedCmd:    rf.log[0].Command,
+				}
+				go rf.handleInstallSnapshot(server, args)
+			} else {
+				args := AppendEntriesArgs{
+					Term:         rf.currentTerm,
+					LeaderId:     rf.me,
+					PrevLogIndex: prevLogIndex,
+					PrevLogTerm:  rf.log[rf.RealLogIdx(prevLogIndex)].Term,
+					LeaderCommit: rf.commitIndex,
+				}
+				if rf.getLastLogIndex() > args.PrevLogIndex {
+					//对方Follower没有落后快照点，但日志没我多，所以向它推送日志
+					startIdx := rf.RealLogIdx(prevLogIndex + 1) //遇到要在log里操作，就要用RealLogIdx
+					// use deep copy to avoid race condition when override log in AppendEntries()
+					// 直接分片其实也能通过测试，但这种做法不安全，因为log可能会被修改，而测试无法模拟这种边界情况
+					// entries := rf.log[(prevLogIndex + 1):]
+					// Raft论文意思是，AppendEntries RPC 传递的是“那一刻的日志条目快照”，应与 leader 后续操作解耦
+					// 所以用make分配空间，再copy，这样更加通用与安全
+					// Raft 的日志是共享状态，任何传出的数据都应该解耦，避免竞态和副作用。
+					entries := make([]LogEntry, len(rf.log[startIdx:]))
+					copy(entries, rf.log[startIdx:])
+					args.Entries = entries
+					DPrintf("leader %v 开始向 server %v 广播新的AppendEntries, lastIncludedIndex=%v, nextIndex[%v]=%v, args = %+v\n", rf.me, server, rf.lastIncludedIndex, server, rf.nextIndex[server], args)
+				} else {
+					//Follower和我一致，没有可发的，所以发个空的
+					args.Entries = make([]LogEntry, 0)
+				}
+				go rf.handleAppendEntries(server, args)
+			}
 
-// 向指定server推送日志
-func (rf *Raft) heartbeat(server int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if rf.state != Leader {
-		// 只有Leader才能推日志
-		return
-	}
-	// 根据账本记录，找到server的最后一条日志条目，那就是nextIndex减一
-	prevLogIndex := rf.nextIndex[server] - 1
-
-	// use deep copy to avoid race condition when override log in AppendEntries()
-	// 直接分片其实也能通过测试，但这种做法不安全，因为log可能会被修改，而测试无法模拟这种边界情况
-	// entries := rf.log[(prevLogIndex + 1):]
-	// Raft论文意思是，AppendEntries RPC 传递的是“那一刻的日志条目快照”，应与 leader 后续操作解耦
-	// 所以用make分配空间，再copy，这样更加通用与安全
-	// Raft 的日志是共享状态，任何传出的数据都应该解耦，避免竞态和副作用。
-	//(2D)，判断是要推送日志还是推送快照
-	DPrintf("PrevLogIndex是 %v ;lastIncludedIndex是%v \n", prevLogIndex, rf.lastIncludedIndex)
-	if prevLogIndex < rf.lastIncludedIndex {
-		// 发现Follower已经落后于快照点，那直接推送快照
-		DPrintf("leader %v 取消向 server %v 广播新的心跳, 改为发送sendInstallSnapshot, lastIncludedIndex=%v, nextIndex[%v]=%v \n", rf.me, server, rf.lastIncludedIndex, server, rf.nextIndex[server])
-		args := InstallSnapshotArgs{
-			Term:              rf.currentTerm,
-			LeaderId:          rf.me,
-			LastIncludedIndex: rf.lastIncludedIndex,
-			LastIncludedTerm:  rf.lastIncludedTerm,
-			Data:              rf.snapShot,
-			LastIncluedCmd:    rf.log[0].Command,
-		}
-		go rf.handleInstallSnapshot(server, args)
-	} else {
-		args := AppendEntriesArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			PrevLogIndex: prevLogIndex,
-			PrevLogTerm:  rf.log[rf.RealLogIdx(prevLogIndex)].Term,
-			LeaderCommit: rf.commitIndex,
-		}
-		if rf.getLastLogIndex() > args.PrevLogIndex {
-			//对方Follower没有落后快照点，但日志没我多，所以向它推送日志
-			startIdx := rf.RealLogIdx(prevLogIndex + 1) //遇到要在log里操作，就要用RealLogIdx
-			entries := make([]LogEntry, len(rf.log[startIdx:]))
-			copy(entries, rf.log[startIdx:])
-			args.Entries = entries
-			DPrintf("leader %v 开始向 server %v 广播新的AppendEntries, lastIncludedIndex=%v, nextIndex[%v]=%v, args = %+v\n", rf.me, server, rf.lastIncludedIndex, server, rf.nextIndex[server], args)
-		} else {
-			//Follower和我一致，没有可发的，所以发个空的
-			args.Entries = make([]LogEntry, 0)
-		}
-		go rf.handleAppendEntries(server, args)
+		}(server)
 	}
 }
 
@@ -762,7 +742,7 @@ func (rf *Raft) handleAppendEntries(server int, args AppendEntriesArgs) {
 	var reply AppendEntriesReply
 	if rf.sendAppendEntries(server, &args, &reply) {
 		rf.mu.Lock()
-		if rf.state != Leader {
+		if rf.role != Leader {
 			rf.mu.Unlock()
 			return
 		}
@@ -805,7 +785,7 @@ func (rf *Raft) handleAppendEntries(server int, args AppendEntriesArgs) {
 			if reply.Term > rf.currentTerm {
 				//对方term比我高，那我这个Leader过期了，所以我要转变为Follower
 				rf.currentTerm = reply.Term
-				rf.switchStateTo(Follower)
+				rf.switchRoleTo(Follower)
 				rf.persist()
 			} else {
 				// 它之前的日志跟我的对应的不一致，所以要降低它的nextIndex，直到一致，然后就能把后面不一致的一口气推过去
@@ -844,30 +824,25 @@ func (rf *Raft) handleAppendEntries(server int, args AppendEntriesArgs) {
 
 // 开始选举，调用者需要加锁
 func (rf *Raft) startElection() {
-	DPrintf("raft%v is starting election\n", rf.me)
+	DPrintf("[选举日志] server %d 发起选举 in term %d \n", rf.me, rf.currentTerm)
 	rf.currentTerm++    //term自增1
 	rf.votedFor = rf.me //自己给自己投票
-	rf.persist()
-	lastLogIndex := rf.getLastLogIndex()
+	rf.persist()        //修改currentTerm和voteFor后，需要持久化
 	//注意选票信息放到外面，不要放到go routine里，不然它创建的args的信息可能不是发起选举的
 	//把我的最后一条日志的索引和term发过去，选民通过这个知道我是否有资格
-	originalTerm := rf.currentTerm
 	args := RequestVoteArgs{
-		Term:         originalTerm,
+		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: lastLogIndex,
-		LastLogTerm:  rf.log[rf.RealLogIdx(lastLogIndex)].Term,
+		LastLogIndex: rf.getLastLogIndex(),
+		LastLogTerm:  rf.log[rf.RealLogIdx(rf.getLastLogIndex())].Term,
 	}
-	rf.voteCount = 1                            //投票数，初始为1，因为自己给自己投了一票
-	rf.heartbeatTimer.Reset(randTimeDuration()) //发起投票，重置计时器
-	//fmt.Printf("[选举日志] server %d 发起选举 in term %d \n", rf.me, rf.currentTerm)
-	for i := range rf.peers {
+	voteCount := 1 //投票数，初始为1，因为自己给自己投了一票
+	for server := range rf.peers {
 		//自己不用给自己发
-		if i == rf.me {
+		if server == rf.me {
 			continue
 		}
 		go func(server int) {
-			//DPrintf("raft%v[%v] is sending RequestVote RPC to raft%v\n", rf.me, rf.state, server)
 			var reply RequestVoteReply
 			if rf.sendRequestVote(server, &args, &reply) {
 				rf.mu.Lock()
@@ -875,19 +850,18 @@ func (rf *Raft) startElection() {
 				//对方term比我高，我变成Follower
 				if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
-					rf.switchStateTo(Follower)
+					rf.switchRoleTo(Follower)
 					rf.persist()
 				}
-				// 2D的脑裂问题，加了个条件rf.currentTerm == args.Term
-				// 保证当选时的Term和竞选时的Term一样
-				if reply.VoteGranted && rf.state == Candidate && rf.currentTerm == originalTerm {
-					rf.voteCount++
-					if rf.voteCount > len(rf.peers)/2 {
-						rf.switchStateTo(Leader)
+				// 2D的脑裂问题，加了个条件rf.currentTerm == args.Term，保证验票时的Term和竞选时的Term一样
+				if reply.VoteGranted && rf.role == Candidate && rf.currentTerm == args.Term {
+					voteCount++
+					if voteCount > len(rf.peers)/2 {
+						rf.switchRoleTo(Leader)
 					}
 				}
 			}
-		}(i)
+		}(server)
 	}
 }
 
@@ -895,7 +869,7 @@ func (rf *Raft) startElection() {
 func (rf *Raft) handleInstallSnapshot(server int, args InstallSnapshotArgs) {
 	rf.mu.Lock()
 	//检查一下还是不是Leader
-	if rf.state != Leader {
+	if rf.role != Leader {
 		rf.mu.Unlock()
 		return
 	}
@@ -916,7 +890,7 @@ func (rf *Raft) handleInstallSnapshot(server int, args InstallSnapshotArgs) {
 			if reply.Term > rf.currentTerm {
 				//发现自己是旧Leader
 				rf.currentTerm = reply.Term
-				rf.switchStateTo(Follower)
+				rf.switchRoleTo(Follower)
 				rf.persist()
 			}
 		}
@@ -1014,9 +988,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.state = Follower //初始都是Follower
-	rf.votedFor = -1    //初始谁都不投
-	rf.dead = 0         //初始都存活
+	rf.role = Follower //初始都是Follower
+	rf.votedFor = -1   //初始谁都不投
+	rf.dead = 0        //初始都存活
 	rf.heartbeatTimer = time.NewTimer(randTimeDuration())
 	rf.applyCh = applyCh
 	rf.log = make([]LogEntry, 1) //Raft`s log start from index 1，Raft的日志索引从1开始，但go的数组从0开始，所以占个位
