@@ -728,7 +728,7 @@ func (rf *Raft) startElection() {
 				// 2D的脑裂问题，加了个条件rf.currentTerm == args.Term，保证验票时的Term和竞选时的Term一样
 				if reply.VoteGranted && rf.role == Candidate && rf.currentTerm == args.Term {
 					voteCount++
-					if voteCount > len(rf.peers)/2 {
+					if voteCount > len(rf.peers)/2 && rf.role != Leader {
 						rf.switchRoleTo(Leader)
 					}
 				}
