@@ -384,12 +384,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 type InstallSnapshotArgs struct {
-	Term              int         //leader’s term
-	LeaderId          int         //so follower can redirect clients
-	LastIncludedIndex int         //index of log entry immediately preceding new ones
-	LastIncludedTerm  int         //term of prevLogIndex entry
-	Data              []byte      //[] raw bytes of the snapshot chunk
-	LastIncluedCmd    interface{} //自己新加的字段，用于在0处占位
+	Term              int    //leader’s term
+	LeaderId          int    //so follower can redirect clients
+	LastIncludedIndex int    //index of log entry immediately preceding new ones
+	LastIncludedTerm  int    //term of prevLogIndex entry
+	Data              []byte //[] raw bytes of the snapshot chunk
 }
 
 type InstallSnapshotReply struct {
@@ -462,7 +461,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		// 7.Discard the entire log
 		// 落后太多了，没有后续日志，直接清空，把lastIncluded的日志条目存入0号占位位置
 		DPrintf("server %v InstallSnapshot:清空log\n", rf.me)
-		rf.log = []LogEntry{{Term: args.LastIncludedTerm, Command: args.LastIncluedCmd}}
+		rf.log = []LogEntry{{Term: args.LastIncludedTerm, Command: nil}}
 	}
 
 	// 8.Reset state machine using snapshot contents (and load snapshot’s cluster configuration)
@@ -485,7 +484,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			SnapshotIndex: args.LastIncludedIndex,
 		}
 	}()
-
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -758,7 +756,6 @@ func (rf *Raft) heartbeats() {
 					LastIncludedIndex: rf.lastIncludedIndex,
 					LastIncludedTerm:  rf.lastIncludedTerm,
 					Data:              rf.snapShot,
-					LastIncluedCmd:    rf.log[0].Command,
 				}
 				go rf.handleInstallSnapshot(server, args)
 			} else {
