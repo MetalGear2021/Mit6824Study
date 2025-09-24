@@ -388,7 +388,7 @@ type InstallSnapshotArgs struct {
 	LeaderId          int         //so follower can redirect clients
 	LastIncludedIndex int         //index of log entry immediately preceding new ones
 	LastIncludedTerm  int         //term of prevLogIndex entry
-	SnapShot          []byte      //[] raw bytes of the snapshot chunk
+	Data              []byte      //[] raw bytes of the snapshot chunk
 	LastIncluedCmd    interface{} //自己新加的字段，用于在0处占位
 }
 
@@ -420,7 +420,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	reply.Term = rf.currentTerm
 	reply.Success = false
 
-	//1.Reply immediately if term < currentTerm 这个Leader太老了,返回false
+	//1.Reply immediately if term < currentTerm
 	if args.Term < rf.currentTerm {
 		DPrintf("server %v 拒绝来自 leader %v 的InstallSnapshot，原因:更小的Term, Leader的Term%v 本节点的Term %v", rf.me, args.LeaderId, args.Term, rf.currentTerm)
 		return
@@ -466,7 +466,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 
 	// 8.Reset state machine using snapshot contents (and load snapshot’s cluster configuration)
-	rf.snapShot = args.SnapShot
+	rf.snapShot = args.Data
 	rf.lastIncludedIndex = args.LastIncludedIndex
 	rf.lastIncludedTerm = args.LastIncludedTerm
 	//更新commitIndex和lastApplied，同理LastIncluedIndex肯定被commit和apply了
@@ -480,7 +480,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	go func() {
 		rf.applyCh <- ApplyMsg{
 			SnapshotValid: true,
-			Snapshot:      args.SnapShot,
+			Snapshot:      args.Data,
 			SnapshotTerm:  args.LastIncludedTerm,
 			SnapshotIndex: args.LastIncludedIndex,
 		}
@@ -757,7 +757,7 @@ func (rf *Raft) heartbeats() {
 					LeaderId:          rf.me,
 					LastIncludedIndex: rf.lastIncludedIndex,
 					LastIncludedTerm:  rf.lastIncludedTerm,
-					SnapShot:          rf.snapShot,
+					Data:              rf.snapShot,
 					LastIncluedCmd:    rf.log[0].Command,
 				}
 				go rf.handleInstallSnapshot(server, args)
