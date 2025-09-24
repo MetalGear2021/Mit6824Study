@@ -331,7 +331,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	reply.Success = false
 
-	// 本节点对于的快照点已经超过本次日志复制的点，没必要接受此日志复制
+	// 本节点对应的快照点已经超过本次日志复制的点，没必要接受此日志复制
 	if rf.lastIncludedIndex > args.PrevLogIndex {
 		return
 	}
@@ -348,7 +348,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// optimistically thinks receiver's log matches with Leader's as a subset
 		// 往好的想，Follower 有可能是Leader的一个子集
 		reply.ConflictIndex = rf.VirtualLogIdx(len(rf.log))
-		// no conflict term  没冲突的Term
+		// no conflict term  没冲突的Term,设为-1
 		reply.ConflictTerm = -1
 		return
 	}
@@ -376,10 +376,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.log = rf.log[:rf.RealLogIdx(args.PrevLogIndex+1)] //截取一致的日志，因为分片左闭右开，要保留PrevLogIndex，所以+1
 	rf.log = append(rf.log, args.Entries...)             //然后把Entries追加
 	rf.persist()                                         //改动了rf.log，要持久化
-	//5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-	// 一致性判断，Leader的CommitIndex和我的commitIndex中最小值，是我的新commitIndex
-	if rf.lastIncludedIndex < args.LeaderCommit && rf.commitIndex < args.LeaderCommit {
-		// 如果直接等于LeaderCommit，会通不过2C实验
+	//5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)(§Figure2)
+	if args.LeaderCommit > rf.commitIndex {
 		rf.setCommitIndex(min(args.LeaderCommit, rf.getLastLogIndex()))
 	}
 	reply.Success = true
@@ -416,6 +414,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
+		rf.switchRoleTo(Follower)
 	}
 
 	reply.Term = rf.currentTerm
@@ -432,23 +431,17 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		return
 	}
 
-	// 3.重复命令，返回true
-	if args.LastIncludedIndex <= rf.lastIncludedIndex /*raft快照点要先于leader时，无需快照*/ {
-		DPrintf("server %v 拒绝来自 leader %v 的InstallSnapshot，原因:落后的lastIncludedIndex，Leader发的LastIncludedIndex%v 本节点的lastIncludedIndex%v", rf.me, args.LeaderId, args.LastIncludedIndex, rf.lastIncludedIndex)
-		// 2D 应该返回成功，虽然没安装快照，但我已经有了，这是幂等性
-		// 这行代码看似简单，背后却是 Raft 协议的精髓之一：安全、幂等、自愈。
+	// 3.我的快照点>=leader的快照点，无需快照，有可能是重复命令，返回true
+	if args.LastIncludedIndex <= rf.lastIncludedIndex {
+		// 应该返回成功，虽然没安装发送快照，但我已经有了
+		// 幂等性:一个操作可以重复执行多次，而不会改变系统的状态或结果
+		// 下面这行代码看似简单，背后却是 Raft 协议的精髓之一：安全、幂等、自愈。
 		// 网络会丢包 → 要能重发请求 -> 请求必须幂等，发现已经实现时，就算什么都不用执行也要返回确认，这样Leader才能正确推进
-		// 节点会崩溃 → 状态必须可恢复
 		reply.Success = true
 		return
 	}
 
 	//----------通过限制，接收快照------------
-	//强转为Follower，顺便重置计时器，注意这和AE不一样，AE不会强转
-	//然后投票给发送者
-	rf.switchRoleTo(Follower)
-	rf.votedFor = args.LeaderId
-
 	//6.If existing Log entry has same index and term as snapshot`s last included entry,retain log entries following it and reply
 	//如果找到了匹配last included的entry，保留后续的条目，然后返回
 	hasEntry := false
@@ -462,13 +455,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 
 	if hasEntry {
-		//有，说明后续有可能有其他日志，所以要截断
-		//只把已经存入snapshot的日志截走，其余部分留下
+		//有，说明后续有可能有其他日志，所以要截断，只把已经存入snapshot的日志截走，其余部分留下
 		DPrintf("server %v InstallSnapshot:args.LastIncludedIndex= %v 位置存在", rf.me, args.LastIncludedIndex)
 		rf.log = rf.log[rIdx:]
 	} else {
 		// 7.Discard the entire log
-		//没有后续日志，直接清空 把lastIncluded的日志条目存入0号占位位置
+		// 落后太多了，没有后续日志，直接清空，把lastIncluded的日志条目存入0号占位位置
 		DPrintf("server %v InstallSnapshot:清空log\n", rf.me)
 		rf.log = []LogEntry{{Term: args.LastIncludedTerm, Command: args.LastIncluedCmd}}
 	}
@@ -484,7 +476,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	reply.Success = true
 	DPrintf("server %v 安装快照成功，快照索引为 %v 任期为%v \n", rf.me, args.LastIncludedIndex, args.LastIncludedTerm)
-	//通知上层服务
+	//通知本节点对应的上层服务机安装快照
 	go func() {
 		rf.applyCh <- ApplyMsg{
 			SnapshotValid: true,
@@ -856,31 +848,23 @@ func (rf *Raft) handleAppendEntries(server int, args AppendEntriesArgs) {
 				rf.switchRoleTo(Follower)
 				rf.persist()
 			} else {
+				//If AppendEntries fails because of log inconsistency:decrement nextIndex and retry
 				// 它之前的日志跟我的对应的不一致，所以要降低它的nextIndex，直到一致，然后就能把后面不一致的一口气推过去
 				// 这里也是性能优化点，如果有1000条日志不一致，那就得呼叫1000次RPC
 				//rf.nextIndex[server]--
 				// (quick fallback)
-				rf.nextIndex[server] = reply.ConflictIndex
-				// if term found, override it to
-				// the first entry after entries in ConflictTerm
-				//如果reply.ConflictTerm == -1，说明是PrevLogIndex不匹配
-				//返回错误后，Leader会修改对应server的nextIndex，变成Follow返回的ConflictIndex
-				//ConflictIndex是Follower发现和Leader不一致后，推测的最早不一致的条目索引，虽然有可能前面还有不一致的
-				//等下次心跳再试试
-				//如果reply.ConflictTerm != -1，那说明PrevLogIndex对应但Term不一致，说明日志不一致，有冲突
-				//所以要往前遍历找相同Term的最开始一条
-				//要结合2D的逻辑索引和lastIncludedIndex
-				if reply.ConflictTerm != -1 {
-					i := args.PrevLogIndex
-					if i < rf.lastIncludedIndex {
-						i = rf.lastIncludedIndex
-					}
-					for ; i > rf.lastIncludedIndex; i-- {
+				// 1.如果reply.ConflictTerm == -1，说明是PrevLogIndex不匹配，修改nextIndex为reply的ConflictIndex
+				// ConflictIndex是Follower发现和Leader不一致后，推测的最早不一致的条目索引，虽然有可能前面还有不一致的
+				// 2.如果reply.ConflictTerm != -1，那说明PrevLogIndex对应但Term不一致，有可能前面相同Term的都不一致
+				// if term found, override it to the first entry after entries in ConflictTerm
+				// 所以要往前遍历找相同Term的最开始一条,要结合2D的逻辑索引和lastIncludedIndex
+				rf.nextIndex[server] = reply.ConflictIndex //保底的，无论找没找到ConflictTerm，先变为ConflictIndex
+				if reply.ConflictTerm == -1 {
+					// in next trial, check if log entries in ConflictTerm matches
+					// 找到最新的Term匹配的日志
+					for i := rf.lastIncludedIndex; i < len(rf.log); i++ {
 						if rf.log[rf.RealLogIdx(i)].Term == reply.ConflictTerm {
-							// in next trial, check if log entries in ConflictTerm matches
-							//从后往前遍历log，找到第一条匹配的
 							rf.nextIndex[server] = i
-							break
 						}
 					}
 				}
