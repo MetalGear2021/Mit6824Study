@@ -747,6 +747,7 @@ func (rf *Raft) heartbeats() {
 			// 根据账本记录，找到server的最后一条日志条目，那就是nextIndex减一
 			prevLogIndex := rf.nextIndex[server] - 1
 			//(2D)，判断是要推送日志还是推送快照
+
 			DPrintf("PrevLogIndex是 %v ;lastIncludedIndex是%v \n", prevLogIndex, rf.lastIncludedIndex)
 			if prevLogIndex < rf.lastIncludedIndex {
 				// 发现Follower已经落后于快照点，那直接推送快照
@@ -770,6 +771,7 @@ func (rf *Raft) heartbeats() {
 					LeaderCommit: rf.commitIndex,
 					Entries:      nil,
 				}
+				// If last log index ≥ nextIndex for a follower: send AppendEntries RPC with log entries starting at nextIndex
 				if rf.getLastLogIndex() > args.PrevLogIndex {
 					//对方Follower没有落后快照点，但日志没我多，所以向它推送日志
 					startIdx := rf.RealLogIdx(prevLogIndex + 1) //遇到要在log里操作，就要用RealLogIdx
@@ -792,35 +794,28 @@ func (rf *Raft) heartbeats() {
 	}
 }
 
-// 处理一个具体发送AE的交互
-// 发送AE后，发现不一致时，也会根据情况发送快照，有三处
-// 这里会有3个情况触发发送InstallSnapshot RPC:
-// Follower的日志过短(PrevLogIndex这个位置在Follower中不存在), 甚至短于lastIncludedIndex
-// Follower的日志在PrevLogIndex这个位置发生了冲突, 回退时发现即使到了lastIncludedIndex也找不到匹配项(大于或小于这个Xterm)
-// nextIndex中记录的索引本身就小于lastIncludedIndex
+// Leader向Follow发送AppendEntries指令
 func (rf *Raft) handleAppendEntries(server int, args AppendEntriesArgs) {
+	rf.mu.Lock()
+	if rf.role != Leader {
+		rf.mu.Unlock()
+		return
+	}
+	rf.mu.Unlock()
+
+	DPrintf("[日志推送]server %v 发送日志给%v 日志索引 %v\n", rf.me, server, args.PrevLogIndex)
 	var reply AppendEntriesReply
 	if rf.sendAppendEntries(server, &args, &reply) {
 		rf.mu.Lock()
-		if rf.role != Leader {
-			rf.mu.Unlock()
-			return
-		}
-		// If last log index ≥ nextIndex for a follower: send
-		// AppendEntries RPC with log entries starting at nextIndex
-		// • If successful: update nextIndex and matchIndex for
-		// follower (§5.3)
-		// • If AppendEntries fails because of log inconsistency:
-		// decrement nextIndex and retry (§5.3)
+		rf.mu.Unlock()
+
 		if reply.Success {
-			// successfully replicated args.Entries
+			// If successfully replicated args.Entries: update nextIndex and matchIndex for follower (§5.3)
 			// 如果目标follower成功写入推送的日志
 			rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries) //已有的+添加的
 			rf.nextIndex[server] = rf.matchIndex[server] + 1              //下一条就是matchIndex+1
 
-			// If there exists an N such that N > commitIndex, a majority
-			// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
-			// set commitIndex = N (§5.3, §5.4).
+			// If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm:set commitIndex = N (§5.3, §5.4).
 			// 再看日志的commit情况，现在看Leader的还没commit的日志,也就是最后一条日志到commitIndex这部分
 			for N := rf.getLastLogIndex(); N > rf.commitIndex; N-- {
 				//试试这个N
@@ -832,7 +827,7 @@ func (rf *Raft) handleAppendEntries(server int, args AppendEntriesArgs) {
 				}
 				//统计一下，看看过半没
 				if count > len(rf.peers)/2 {
-					// most of nodes agreed on rf.log[i]
+					// most of nodes agreed on index N
 					// 过半节点的日志都记录了N之前的条目，那就可以推动commit了
 					if rf.lastIncludedIndex < N {
 						rf.setCommitIndex(N)
@@ -848,7 +843,7 @@ func (rf *Raft) handleAppendEntries(server int, args AppendEntriesArgs) {
 				rf.switchRoleTo(Follower)
 				rf.persist()
 			} else {
-				//If AppendEntries fails because of log inconsistency:decrement nextIndex and retry
+				//If AppendEntries fails because of log inconsistency:decrement nextIndex and retry(§5.3)
 				// 它之前的日志跟我的对应的不一致，所以要降低它的nextIndex，直到一致，然后就能把后面不一致的一口气推过去
 				// 这里也是性能优化点，如果有1000条日志不一致，那就得呼叫1000次RPC
 				//rf.nextIndex[server]--
@@ -861,33 +856,32 @@ func (rf *Raft) handleAppendEntries(server int, args AppendEntriesArgs) {
 				rf.nextIndex[server] = reply.ConflictIndex //保底的，无论找没找到ConflictTerm，先变为ConflictIndex
 				if reply.ConflictTerm == -1 {
 					// in next trial, check if log entries in ConflictTerm matches
-					// 找到最新的Term匹配的日志
-					for i := rf.lastIncludedIndex; i < len(rf.log); i++ {
+					// 找到最新的Term匹配的日志  3333344444[4]555  <------
+					for i := rf.getLastLogIndex(); i >= rf.lastIncludedIndex; i-- {
 						if rf.log[rf.RealLogIdx(i)].Term == reply.ConflictTerm {
 							rf.nextIndex[server] = i
+							break
 						}
 					}
 				}
 			}
 		}
-		rf.mu.Unlock()
+
 	}
 }
 
 // Leader向Follow发送InstallSnapshot指令
 func (rf *Raft) handleInstallSnapshot(server int, args InstallSnapshotArgs) {
 	rf.mu.Lock()
-	//检查一下还是不是Leader
 	if rf.role != Leader {
 		rf.mu.Unlock()
 		return
 	}
-	rf.mu.Unlock() //最好在发送RPC时解锁
+	rf.mu.Unlock()
 
-	DPrintf("server %v 发送快照给%v 快照索引 %v\n", rf.me, server, args.LastIncludedIndex)
-	reply := InstallSnapshotReply{}
+	DPrintf("[快照推送]server %v 发送快照给%v 快照索引 %v\n", rf.me, server, args.LastIncludedIndex)
+	var reply InstallSnapshotReply
 	if rf.sendInstallSnapshot(server, &args, &reply) {
-		//发送RPC成功了
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 
